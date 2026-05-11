@@ -2,6 +2,7 @@
 #![allow(non_snake_case)]
 
 mod pak;
+mod proxy;
 mod sigscan;
 
 use minhook::MinHook;
@@ -37,12 +38,13 @@ unsafe fn install() -> Result<(), Box<dyn core::error::Error>> {
 
 #[unsafe(no_mangle)]
 pub extern "system" fn DllMain(
-    _h: HINSTANCE,
+    h: HINSTANCE,
     reason: u32,
     _reserved: *mut core::ffi::c_void,
 ) -> i32 {
     if reason == DLL_PROCESS_ATTACH {
         unsafe {
+            proxy::init(h);
             let _ = install();
         }
     }
