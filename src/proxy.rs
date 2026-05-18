@@ -1,7 +1,8 @@
 use core::arch::asm;
 use core::ffi::c_void;
 use core::ptr;
-use windows_sys::Win32::Foundation::HINSTANCE;
+
+use windows_sys::Win32::Foundation::{HINSTANCE, HMODULE};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 
 #[repr(C)]
@@ -46,25 +47,20 @@ struct LdrDataTableEntry {
     base_dll_name: UnicodeString,
 }
 
-static SPOOF_NAME: [u16; 11] = [
-    b'_' as u16, b'p' as u16, b'r' as u16, b'o' as u16, b'x' as u16,
-    b'y' as u16, b'_' as u16, b'v' as u16, b'.' as u16, b'd' as u16,
-    b'l' as u16,
-];
+const fn ascii_u16<const N: usize>(s: &[u8; N]) -> [u16; N] {
+    let mut out = [0u16; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = s[i] as u16;
+        i += 1;
+    }
+    out
+}
 
-const SYSTEM_DLL: &[u16] = &[
-    b'C' as u16, b':' as u16, b'\\' as u16,
-    b'W' as u16, b'i' as u16, b'n' as u16, b'd' as u16, b'o' as u16,
-    b'w' as u16, b's' as u16, b'\\' as u16,
-    b'S' as u16, b'y' as u16, b's' as u16, b't' as u16, b'e' as u16,
-    b'm' as u16, b'3' as u16, b'2' as u16, b'\\' as u16,
-    b'v' as u16, b'e' as u16, b'r' as u16, b's' as u16, b'i' as u16,
-    b'o' as u16, b'n' as u16, b'.' as u16, b'd' as u16, b'l' as u16,
-    b'l' as u16, 0,
-];
+static SPOOF_NAME: [u16; 11] = ascii_u16(b"_proxy_v.dl");
+static VERSION_DLL_NAME: [u16; 11] = ascii_u16(b"version.dll");
+static SYSTEM_DLL: [u16; 32] = ascii_u16(b"C:\\Windows\\System32\\version.dll\0");
 
-// Populated by init() during DllMain before LoadLibrary returns, so thunks
-// always observe non-null pointers under loader synchronization.
 static mut REAL_GET_FILE_VERSION_INFO_A: *mut c_void = ptr::null_mut();
 static mut REAL_GET_FILE_VERSION_INFO_BY_HANDLE: *mut c_void = ptr::null_mut();
 static mut REAL_GET_FILE_VERSION_INFO_EX_A: *mut c_void = ptr::null_mut();
@@ -83,47 +79,103 @@ static mut REAL_VER_LANGUAGE_NAME_W: *mut c_void = ptr::null_mut();
 static mut REAL_VER_QUERY_VALUE_A: *mut c_void = ptr::null_mut();
 static mut REAL_VER_QUERY_VALUE_W: *mut c_void = ptr::null_mut();
 
-unsafe fn rename_self(our_base: *mut c_void) -> bool {
-    let peb: *const Peb;
+unsafe fn read_peb() -> *const Peb {
+    let p: *const Peb;
     unsafe {
-        asm!("mov {}, gs:[0x60]", out(reg) peb, options(nostack, preserves_flags));
+        asm!("mov {}, gs:[0x60]", out(reg) p, options(nostack, preserves_flags));
     }
-    if peb.is_null() {
-        return false;
-    }
-    let ldr = unsafe { (*peb).ldr };
-    if ldr.is_null() {
-        return false;
-    }
-    let head = unsafe { (&raw const (*ldr).in_load_order_module_list) as *mut ListEntry };
-    let mut cur = unsafe { (*head).flink };
-    let mut steps: u32 = 0;
-    while !cur.is_null() && cur != head && steps < 1024 {
-        let entry = cur as *mut LdrDataTableEntry;
-        if unsafe { (*entry).dll_base } == our_base {
-            unsafe {
-                (*entry).base_dll_name.buffer = SPOOF_NAME.as_ptr() as *mut u16;
-                (*entry).base_dll_name.length = (SPOOF_NAME.len() * 2) as u16;
-                (*entry).base_dll_name.maximum_length = (*entry).base_dll_name.length;
-            }
-            return true;
+    p
+}
+
+unsafe fn for_each_module(mut f: impl FnMut(*mut LdrDataTableEntry) -> bool) {
+    unsafe {
+        let peb = read_peb();
+        if peb.is_null() {
+            return;
         }
-        cur = unsafe { (*cur).flink };
-        steps += 1;
+        let ldr = (*peb).ldr;
+        if ldr.is_null() {
+            return;
+        }
+        let head = (&raw const (*ldr).in_load_order_module_list) as *mut ListEntry;
+        let mut cur = (*head).flink;
+        let mut steps: u32 = 0;
+        while !cur.is_null() && cur != head && steps < 1024 {
+            if f(cur as *mut LdrDataTableEntry) {
+                return;
+            }
+            cur = (*cur).flink;
+            steps += 1;
+        }
     }
-    false
+}
+
+// Rename our PEB entry so `LoadLibraryW("version.dll")` misses the loader's
+// name cache and fetches the system DLL. No-op under Wine.
+unsafe fn rename_self(our_base: *mut c_void) {
+    unsafe {
+        for_each_module(|entry| {
+            if (*entry).dll_base != our_base {
+                return false;
+            }
+            (*entry).base_dll_name.buffer = SPOOF_NAME.as_ptr() as *mut u16;
+            (*entry).base_dll_name.length = (SPOOF_NAME.len() * 2) as u16;
+            (*entry).base_dll_name.maximum_length = (*entry).base_dll_name.length;
+            true
+        });
+    }
+}
+
+unsafe fn find_other_version_dll(excluded: *mut c_void) -> Option<HMODULE> {
+    let mut found: Option<HMODULE> = None;
+    unsafe {
+        for_each_module(|entry| {
+            if (*entry).dll_base == excluded
+                || !unicode_eq_ascii_ci(&(*entry).base_dll_name, &VERSION_DLL_NAME)
+            {
+                return false;
+            }
+            found = Some((*entry).dll_base as HMODULE);
+            true
+        });
+    }
+    found
+}
+
+unsafe fn unicode_eq_ascii_ci(s: &UnicodeString, lowercase_needle: &[u16]) -> bool {
+    let len = (s.length / 2) as usize;
+    if len != lowercase_needle.len() {
+        return false;
+    }
+    for i in 0..len {
+        let mut a = unsafe { *s.buffer.add(i) };
+        if (b'A' as u16..=b'Z' as u16).contains(&a) {
+            a += 32;
+        }
+        if a != lowercase_needle[i] {
+            return false;
+        }
+    }
+    true
 }
 
 pub unsafe fn init(our_module: HINSTANCE) {
     unsafe {
-        let _ = rename_self(our_module as *mut c_void);
-        let h = LoadLibraryW(SYSTEM_DLL.as_ptr());
+        let our_base = our_module as *mut c_void;
+        rename_self(our_base);
+        let loaded = LoadLibraryW(SYSTEM_DLL.as_ptr());
+        // Windows: `loaded` is the system DLL. Wine: `loaded` is usually us,
+        // so we walk the PEB for the builtin
+        let h: HMODULE = if loaded.is_null() || loaded == our_module {
+            find_other_version_dll(our_base).unwrap_or(ptr::null_mut())
+        } else {
+            loaded
+        };
         if h.is_null() {
             return;
         }
         let resolve = |name: &[u8]| -> *mut c_void {
-            GetProcAddress(h, name.as_ptr())
-                .map_or(ptr::null_mut(), |f| f as *mut c_void)
+            GetProcAddress(h, name.as_ptr()).map_or(ptr::null_mut(), |f| f as *mut c_void)
         };
         REAL_GET_FILE_VERSION_INFO_A = resolve(b"GetFileVersionInfoA\0");
         REAL_GET_FILE_VERSION_INFO_BY_HANDLE = resolve(b"GetFileVersionInfoByHandle\0");
@@ -145,8 +197,8 @@ pub unsafe fn init(our_module: HINSTANCE) {
     }
 }
 
-// Naked jmp preserves registers and stack args, avoiding per-export signatures.
-// Null pointer falls through to `xor eax, eax; ret` for a clean failure.
+// Naked `jmp [REAL]` preserves all registers and stack args. Null `REAL` falls
+// through to `xor eax, eax; ret`.
 macro_rules! proxy_thunk {
     ($name:ident, $real:ident) => {
         #[unsafe(naked)]
