@@ -17,14 +17,22 @@ const PATTERN: &[u8] =
     b"\xE8\x00\x00\x00\x00\x48\x8B\xF8\x39\x70\x00\x0F\x84\x00\x00\x00\x00";
 const MASK: &[u8] = b"x????xxxxx?xx????";
 
-// The zeroed keys handed back to the engine. `static mut` (writable .data)
-// because the engine reads this struct; it is never mutated at runtime.
+// The delegate handed back to the engine. `static mut` (writable .data) because
+// the engine can bind through our hook and write into it; the hook re-zeros it.
 static mut SIGNING_KEYS: pak::FPakSigningKeys = pak::FPakSigningKeys { function: 0, size: 0 };
 
-// Replaces the engine's GetPakSigningKeysDelegate: always reports "no keys", so
-// unsigned content is accepted.
+// Replaces the engine's GetPakSigningKeysDelegate: always reports "no keys" so
+// unsigned content is accepted. Re-zeroed every call: RegisterSigningKeyCallback
+// binds the delegate through this same getter, so if we hooked before that bind
+// it writes a non-zero DelegateSize (offset 8) into our struct. Zeroing right
+// before each read keeps IsBound() false no matter when we loaded.
 unsafe extern "system" fn get_pak_signing_keys() -> *mut pak::FPakSigningKeys {
-    &raw mut SIGNING_KEYS
+    let p = &raw mut SIGNING_KEYS;
+    unsafe {
+        (*p).function = 0;
+        (*p).size = 0;
+    }
+    p
 }
 
 unsafe fn install() -> Option<()> {
