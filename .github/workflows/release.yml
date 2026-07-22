@@ -22,12 +22,12 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/rivals_sigbypass.dll dist/rivals-sigbypass.asi
+          Copy-Item target/release/RivalsSigBypass.dll dist/RivalsSigBypass.asi
 
       # Publishes only on a version tag (v*); a manual run just verifies the build.
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/rivals-sigbypass.asi
+          files: dist/RivalsSigBypass.asi
           fail_on_unmatched_files: true
