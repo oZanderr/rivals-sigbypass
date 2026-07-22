@@ -31,7 +31,7 @@ pub fn main_module() -> Option<ModuleInfo> {
 
 pub unsafe fn sig_scan(pattern: &[u8], mask: &[u8], region: &ModuleInfo) -> Option<*mut u8> {
     let n = mask.len();
-    if region.size < n {
+    if pattern.len() < n || region.size < n {
         return None;
     }
     unsafe {
